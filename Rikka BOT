@@ -1,0 +1,1402 @@
+import discord
+from discord.ext import commands, tasks
+from datetime import datetime, timedelta
+import asyncio # noqa: F401
+import json
+import os
+from flask import Flask
+from threading import Thread
+import time
+
+# ===========================================
+# НАСТРОЙКА ЧАСОВОГО ПОЯСА (МОСКОВСКОЕ ВРЕМЯ)
+# ===========================================
+import pytz  # Добавьте эту строку
+
+# Установите pytz если нет: pip install pytz
+# pip install pytz
+
+# Часовой пояс для бота
+TIMEZONE = pytz.timezone('Europe/Moscow')
+
+def get_now():
+    """Получить текущее время по Москве"""
+    return datetime.now(TIMEZONE)
+
+def parse_datetime(year, month, day, hour, minute):
+    """Создать datetime объект в московском времени"""
+    naive_dt = datetime(year, month, day, hour, minute)
+    return TIMEZONE.localize(naive_dt)
+
+def from_iso_with_timezone(iso_string):
+    """Преобразовать ISO строку в datetime с учетом московского времени"""
+    try:
+        dt = datetime.fromisoformat(iso_string)
+        # Если нет информации о часовом поясе, считаем что это московское время
+        if dt.tzinfo is None:
+            return TIMEZONE.localize(dt)
+        return dt.astimezone(TIMEZONE)
+    except ValueError:
+        # Для старых записей без часового пояса
+        if 'Z' in iso_string:
+            dt = datetime.fromisoformat(iso_string.replace('Z', '+00:00'))
+        else:
+            dt = datetime.fromisoformat(iso_string + '+00:00')
+        return dt.astimezone(TIMEZONE)
+
+TOKEN = 'MTQ1MDk5MTIwNzAzMDQ1NjM0MQ.GWUS0j.NUqR8OI7dWFezX_7LcjmxYKf8BZzujDinv9YaE'
+
+intents = discord.Intents.default()
+intents.members = True
+intents.message_content = True
+
+bot = commands.Bot(command_prefix='!', intents=intents)
+
+CONFIG_FILE = 'config.json'
+
+class EventAnnouncement:
+    def __init__(self, bot):
+        self.bot = bot
+        self.events = self.load_events()
+        self.recurring_events = self.load_recurring_events()  # Новые периодические события
+        self.config = self.load_config()
+        self.check_events.start()
+        self.cleanup_events.start()  # Автоматическая очистка
+        self.check_recurring_events.start()  # Проверка периодических событий
+    
+    def load_config(self):
+        """Загрузка конфигурации"""
+        if os.path.exists(CONFIG_FILE):
+            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        return {
+            'announcement_channel_id': None,
+            'admin_channel_id': None,
+            'allowed_roles': []  # Новое поле: список ID разрешенных ролей
+        }
+    
+    def save_config(self):
+        """Сохранение конфигурации"""
+        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+            json.dump(self.config, f, ensure_ascii=False, indent=2)
+    
+    def load_events(self):
+        """Загрузка обычных событий из файла"""
+        if os.path.exists('events.json'):
+            with open('events.json', 'r', encoding='utf-8') as f:
+                return json.load(f)
+        return []
+    
+    def save_events(self):
+        """Сохранение обычных событий в файл"""
+        with open('events.json', 'w', encoding='utf-8') as f:
+            json.dump(self.events, f, ensure_ascii=False, indent=2)
+    
+    def load_recurring_events(self):
+        """Загрузка периодических событий из файла"""
+        if os.path.exists('recurring_events.json'):
+            with open('recurring_events.json', 'r', encoding='utf-8') as f:
+                return json.load(f)
+        return []
+    
+    def save_recurring_events(self):
+        """Сохранение периодических событий в файл"""
+        with open('recurring_events.json', 'w', encoding='utf-8') as f:
+            json.dump(self.recurring_events, f, ensure_ascii=False, indent=2)
+    
+    def add_event(self, event_name, event_time, announcement_time, author_id, 
+                  custom_message=None, image_url=None, attachments=None):
+        """Добавление нового обычного события"""
+        event = {
+            'id': len(self.events) + 1,
+            'name': event_name,
+            'event_time': event_time.isoformat(),
+            'announcement_time': announcement_time.isoformat(),
+            'author': author_id,
+            'custom_message': custom_message,
+            'image_url': image_url,
+            'attachments': attachments or [],
+            'announced': False,
+            'finished': False,
+            'is_recurring': False  # Это обычное событие
+        }
+        self.events.append(event)
+        self.save_events()
+        return event['id']
+    
+    def add_recurring_event(self, event_name, days_of_week, hour, minute, 
+                           author_id, custom_message=None, image_url=None, attachments=None):
+        """Добавление нового периодического события"""
+        # Дни недели: список 0-понедельник, 6-воскресенье
+        event = {
+            'id': len(self.recurring_events) + 1,
+            'name': event_name,
+            'days_of_week': days_of_week,  # Список дней [0, 2, 4] для пн, ср, пт
+            'hour': hour,
+            'minute': minute,
+            'author': author_id,
+            'custom_message': custom_message,
+            'image_url': image_url,
+            'attachments': attachments or [],
+            'is_recurring': True,
+            'last_scheduled': {}
+        }
+        self.recurring_events.append(event)
+        self.save_recurring_events()
+        return event['id']
+    
+    def remove_event(self, event_id, is_recurring=False):
+        """Удаление события (обычного или периодического)"""
+        if is_recurring:
+            self.recurring_events = [e for e in self.recurring_events if e['id'] != event_id]
+            self.save_recurring_events()
+        else:
+            self.events = [e for e in self.events if e['id'] != event_id]
+            self.save_events()
+    
+    async def send_announcement(self, event, is_recurring=False):
+        """Отправка объявления в канал"""
+        channel_id = self.config.get('announcement_channel_id')
+        if not channel_id:
+            print("Ошибка: не установлен канал для объявлений")
+            return False
+        
+        channel = self.bot.get_channel(channel_id)
+        if not channel:
+            print(f"Ошибка: канал {channel_id} не найден")
+            return False
+        
+        # Создаем embed для красивого объявления
+        if is_recurring:
+            title = f"📢 **{event['name']}** (Регулярное)"
+        else:
+            title = f"📢 **{event['name']}**"
+        
+        if is_recurring:
+            event_time = get_now() + timedelta(minutes=15)
+        else:
+            event_time = from_iso_with_timezone(event['event_time'])
+        
+        embed = discord.Embed(
+            title=title,
+            description=event['custom_message'],
+            color=discord.Color.gold(),
+            timestamp=event_time
+        )
+        
+        if is_recurring:
+            # Для периодических событий показываем, что начинается через 15 минут
+            embed.add_field(
+                name="⏰ Начинается", 
+                value="Через 15 минут",
+                inline=False
+            )
+        else:
+            embed.add_field(
+                name="⏰ Начинается", 
+                value=f"<t:{int(event_time.timestamp())}:F>",
+                inline=False
+            )
+        
+        # Если есть изображение, добавляем его
+        if event.get('image_url'):
+            embed.set_image(url=event['image_url'])
+        
+        # Если есть вложения, отмечаем их
+        if event.get('attachments'):
+            embed.set_footer(text=f"📎 {len(event['attachments'])} вложений | ID: {event['id']}")
+        else:
+            embed.set_footer(text=f"ID: {event['id']}")
+        
+        try:
+            # Отправляем embed
+            await channel.send(embed=embed)
+            
+            # Если есть вложения, отправляем их отдельно
+            for attachment_url in event.get('attachments', []):
+                await channel.send(f"📎 Вложение: {attachment_url}")
+            
+            if not is_recurring:
+                event['announced'] = True
+                self.save_events()
+            
+            return True
+        except Exception as e:
+            print(f"Ошибка отправки: {e}")
+            return False
+    
+    @tasks.loop(seconds=30)
+    async def check_events(self):
+        """Проверка обычных событий для отправки объявлений"""
+        now = get_now()
+        
+        for event in self.events:
+            if event['finished']:
+                continue
+            
+            announcement_time = from_iso_with_timezone(event['announcement_time'])
+            event_time = from_iso_with_timezone(event['event_time'])
+            
+            # Если время для объявления наступило
+            if not event['announced'] and announcement_time <= now:
+                await self.send_announcement(event)
+            
+            # Если событие уже прошло
+            if event_time <= now:
+                event['finished'] = True
+                self.save_events()
+    
+    @tasks.loop(seconds=60)  # Проверяем каждую минуту
+    async def check_recurring_events(self):
+        """Проверка периодических событий"""
+        now = get_now()
+        current_day = now.weekday()  # 0-понедельник, 6-воскресенье
+        current_hour = now.hour
+        current_minute = now.minute
+        
+        for event in self.recurring_events:
+            # Проверяем, совпадает ли текущий день с одним из указанных дней
+            if current_day in event['days_of_week']:
+                event_hour = event['hour']
+                event_minute = event['minute']
+                
+                # Рассчитываем время объявления (за 15 минут до события)
+                announcement_time = now.replace(hour=event_hour, minute=event_minute) - timedelta(minutes=15)
+                
+                # Если текущее время совпадает с временем объявления
+                if (current_hour == announcement_time.hour and 
+                    current_minute == announcement_time.minute):
+                    
+                    # Проверяем, не отправляли ли мы уже объявление сегодня для этого дня
+                    last_scheduled = event.get('last_scheduled', {})
+                    today = now.date()
+                    day_key = str(current_day)
+                    
+                    if last_scheduled.get(day_key) != str(today):
+                        # Отправляем объявление
+                        await self.send_announcement(event, is_recurring=True)
+                        
+                        # Обновляем дату последнего объявления для этого дня
+                        last_scheduled[day_key] = str(today)
+                        event['last_scheduled'] = last_scheduled
+                        self.save_recurring_events()
+    
+    @tasks.loop(hours=6)  # Автоматическая очистка каждые 6 часов
+    async def cleanup_events(self):
+        """АВТОМАТИЧЕСКАЯ очистка старых событий (старше 3 дней)"""
+        now = get_now()
+        events_to_remove = []
+        
+        for event in self.events:
+            if event['finished']:
+                event_time = from_iso_with_timezone(event['event_time'])
+                days_passed = (now - event_time).days
+                
+                # Удаляем события, завершенные более 3 дней назад
+                if days_passed > 3:
+                    events_to_remove.append((event['id'], False))
+        
+        # Удаляем старые события
+        for event_id, is_recurring in events_to_remove:
+            self.remove_event(event_id, is_recurring)
+        
+        if events_to_remove:
+            print(f"✅ Автоматически удалено {len(events_to_remove)} старых событий")
+            await self.send_admin_log(f"🧹 Автоматически удалено {len(events_to_remove)} старых событий")
+    
+    async def send_admin_log(self, message):
+        """Отправка сообщения в админ-канал"""
+        channel_id = self.config.get('admin_channel_id')
+        if not channel_id:
+            return
+        
+        channel = self.bot.get_channel(channel_id)
+        if channel:
+            await channel.send(message)
+    
+    @check_events.before_loop
+    async def before_check_events(self):
+        await self.bot.wait_until_ready()
+    
+    @check_recurring_events.before_loop
+    async def before_check_recurring_events(self):
+        await self.bot.wait_until_ready()
+    
+    @cleanup_events.before_loop
+    async def before_cleanup_events(self):
+        await self.bot.wait_until_ready()
+
+# Инициализация системы объявлений
+event_manager = None
+
+@bot.event
+async def on_ready():
+    print(f'Бот {bot.user} запущен!')
+    global event_manager
+    event_manager = EventAnnouncement(bot)
+
+# ===========================================
+# ПРОВЕРКА ПРАВ ДОСТУПА
+# ===========================================
+
+async def check_permissions(ctx):
+    """Проверка прав пользователя"""
+    # 1. Проверка на наличие event_manager
+    if not event_manager:
+        return False
+    
+    # 2. Проверка админ-канала
+    admin_channel_id = event_manager.config.get('admin_channel_id')
+    if not admin_channel_id or ctx.channel.id != admin_channel_id:
+        return False
+    
+    # 3. Проверка прав администратора Discord
+    if ctx.author.guild_permissions.administrator:
+        return True
+    
+    # 4. Проверка разрешенных ролей
+    allowed_roles = event_manager.config.get('allowed_roles', [])
+    
+    # Получаем ID всех ролей пользователя
+    user_role_ids = [role.id for role in ctx.author.roles]
+    
+    # Проверяем, есть ли у пользователя хотя бы одна разрешенная роль
+    for role_id in allowed_roles:
+        if role_id in user_role_ids:
+            return True
+    
+    return False
+
+# ===========================================
+# КОМАНДА ПОМОЩИ
+# ===========================================
+
+@bot.command()
+async def помощь(ctx):
+    """Показать все доступные команды"""
+    if not await check_permissions(ctx):
+        await ctx.send("❌ У вас нет доступа к этой команде!")
+        return
+    
+    embed = discord.Embed(
+        title="📚 **СПРАВКА ПО КОМАНДАМ**",
+        description="Все команды работают только в установленном админ-канале",
+        color=discord.Color.blue()
+    )
+    
+    # Основные команды управления событиями
+    embed.add_field(
+        name="🎯 **ОСНОВНЫЕ КОМАНДЫ**",
+        value=(
+            "`!новое ДД ММ ГГГГ ЧЧ ММ текст`\n"
+            "Создать разовое событие\n"
+            "*Пример: !новое 25 12 2024 20 0 Новогодняя вечеринка*\n\n"
+            
+            "`!регулярное дни ЧЧ ММ текст`\n"
+            "Создать регулярное событие\n"
+            "*Пример: !регулярное пн,ср,пт 19 00 Игровой вечер*\n"
+            "*Дни: пн, вт, ср, чт, пт, сб, вс (можно несколько через запятую)*\n\n"
+            
+            "`!события`\n"
+            "Показать все события (активные и завершенные)\n\n"
+            
+            "`!регулярные`\n"
+            "Показать все регулярные события\n\n"
+            
+            "`!инфо ID`\n"
+            "Подробная информация о событии\n"
+            "*Пример: !инфо 5*\n\n"
+            
+            "`!удалить ID`\n"
+            "Удалить разовое событие\n"
+            "*Пример: !удалить 3*\n\n"
+            
+            "`!удалитьрег ID`\n"
+            "Удалить регулярное событие\n"
+            "*Пример: !удалитьрег 2*\n\n"
+            
+            "`!очистка`\n"
+            "Ручная очистка старых событий (старше 3 дней)"
+        ),
+        inline=False
+    )
+    
+    # Команды для управления ролями и настройками
+    embed.add_field(
+        name="⚙️ **КОМАНДЫ ДЛЯ РОЛЕЙ И НАСТРОЕК**",
+        value=(
+            "`!роли`\n"
+            "Показать все разрешенные роли\n\n"
+            
+            "`!каналы`\n"
+            "Проверить настроенные каналы и статистику\n\n"
+            
+            "`!тест`\n"
+            "Проверить работу бота и настройки\n\n"
+            
+            "`!помощь`\n"
+            "Показать это сообщение"
+        ),
+        inline=False
+    )
+    
+    # Команды только для администраторов
+    if ctx.author.guild_permissions.administrator:
+        embed.add_field(
+            name="👑 **ТОЛЬКО ДЛЯ АДМИНИСТРАТОРОВ**",
+            value=(
+                "`!каналадмин`\n"
+                "Установить текущий канал для управления\n\n"
+                
+                "`!каналобъявлений`\n"
+                "Установить канал для объявлений\n\n"
+                
+                "`!добавитьроль @роль`\n"
+                "Добавить разрешенную роль\n"
+                "*Пример: !добавитьроль @Офицер*\n\n"
+                
+                "`!удалитьроль @роль`\n"
+                "Удалить роль из разрешенных\n"
+                "*Пример: !удалитьроль @Модератор*\n\n"
+                
+                "`!рассылка текст`\n"
+                "Отправить тестовое объявление\n"
+                "*Пример: !рассылка Тест работы бота*"
+            ),
+            inline=False
+        )
+    
+    # Полезная информация
+    embed.add_field(
+    name="💡 **ПОЛЕЗНАЯ ИНФОРМАЦИЯ**",
+    value=(
+        "• Все события создаются по **московскому времени** (MSK, UTC+3)\n"
+        "• Проверить текущее время: `!время`\n"
+        "• Все события автоматически удаляются через 3 дня после завершения\n"
+        "• Регулярные события объявляются каждую неделю за 15 минут до начала\n"
+        "• Можно указывать несколько дней через запятую (пн,ср,пт)\n"
+        "• К командам можно прикреплять изображения и файлы\n"
+        "• Формат времени: 24-часовой (14:30, 20:00 и т.д.)\n"
+        "• Объявления отправляются в установленный канал объявлений"
+    ),
+    inline=False
+)
+    
+    # Статус доступа пользователя
+    if ctx.author.guild_permissions.administrator:
+        access_status = "👑 Администратор сервера"
+    else:
+        allowed_roles = event_manager.config.get('allowed_roles', [])
+        user_roles = [role for role in ctx.author.roles if role.id in allowed_roles]
+        if user_roles:
+            role_names = ", ".join([role.name for role in user_roles])
+            access_status = f"✅ Доступ через роли: {role_names}"
+        else:
+            access_status = "❌ Нет доступа (только просмотр команд)"
+    
+    embed.set_footer(text=f"Ваш статус: {access_status}")
+    
+    await ctx.send(embed=embed)
+
+@bot.command()
+async def время(ctx):
+    """Показать текущее московское время бота"""
+    now = get_now()
+    
+    embed = discord.Embed(
+        title="🕒 **МОСКОВСКОЕ ВРЕМЯ БОТА**",
+        color=discord.Color.blue(),
+        timestamp=now
+    )
+    
+    embed.add_field(
+        name="📍 Московское время",
+        value=now.strftime("%d.%m.%Y %H:%M:%S"),
+        inline=True
+    )
+    
+    embed.add_field(
+        name="🌐 Часовой пояс",
+        value="Europe/Moscow (UTC+3)",
+        inline=True
+    )
+    
+    embed.add_field(
+        name="⏰ Discord Timestamp",
+        value=f"`<t:{int(now.timestamp())}:F>`\n<t:{int(now.timestamp())}:F>",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="💡 Для создания событий",
+        value="Все события создаются по этому времени",
+        inline=False
+    )
+    
+    await ctx.send(embed=embed)
+
+# ===========================================
+# КОМАНДЫ ДЛЯ УПРАВЛЕНИЯ РОЛЯМИ
+# ===========================================
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def добавитьроль(ctx, роль: discord.Role):
+    """Добавить роль, которая может управлять событиями"""
+    allowed_roles = event_manager.config.get('allowed_roles', [])
+    
+    if роль.id not in allowed_roles:
+        allowed_roles.append(роль.id)
+        event_manager.config['allowed_roles'] = allowed_roles
+        event_manager.save_config()
+        
+        embed = discord.Embed(
+            title="✅ Роль добавлена",
+            description=f"Роль {роль.mention} теперь может управлять событиями",
+            color=discord.Color.green()
+        )
+        await ctx.send(embed=embed)
+    else:
+        await ctx.send(f"❌ Роль {роль.mention} уже есть в списке разрешенных")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def удалитьроль(ctx, роль: discord.Role):
+    """Удалить роль из разрешенных"""
+    allowed_roles = event_manager.config.get('allowed_roles', [])
+    
+    if роль.id in allowed_roles:
+        allowed_roles.remove(роль.id)
+        event_manager.config['allowed_roles'] = allowed_roles
+        event_manager.save_config()
+        
+        embed = discord.Embed(
+            title="✅ Роль удалена",
+            description=f"Роль {роль.mention} больше не может управлять событиями",
+            color=discord.Color.green()
+        )
+        await ctx.send(embed=embed)
+    else:
+        await ctx.send(f"❌ Роль {роль.mention} не найдена в списке разрешенных")
+
+@bot.command()
+async def роли(ctx):
+    """Показать все разрешенные роли"""
+    if not await check_permissions(ctx):
+        await ctx.send("❌ У вас нет доступа к этой команде!")
+        return
+    
+    allowed_roles = event_manager.config.get('allowed_roles', [])
+    
+    if not allowed_roles:
+        embed = discord.Embed(
+            title="📋 Разрешенные роли",
+            description="❌ Нет разрешенных ролей. Только администраторы могут управлять событиями.",
+            color=discord.Color.red()
+        )
+    else:
+        roles_list = []
+        roles_to_remove = []
+        
+        for role_id in allowed_roles:
+            role = ctx.guild.get_role(role_id)
+            if role:
+                roles_list.append(f"• {role.mention}")
+            else:
+                # Если роль не найдена, добавляем в список для удаления
+                roles_to_remove.append(role_id)
+        
+        # Удаляем несуществующие роли
+        if roles_to_remove:
+            for role_id in roles_to_remove:
+                allowed_roles.remove(role_id)
+            event_manager.config['allowed_roles'] = allowed_roles
+            event_manager.save_config()
+        
+        if roles_list:
+            embed = discord.Embed(
+                title="📋 Разрешенные роли",
+                description="\n".join(roles_list),
+                color=discord.Color.blue()
+            )
+            embed.set_footer(text=f"Всего ролей: {len(roles_list)}")
+        else:
+            embed = discord.Embed(
+                title="📋 Разрешенные роли",
+                description="❌ Все указанные роли не найдены на сервере",
+                color=discord.Color.red()
+            )
+    
+    await ctx.send(embed=embed)
+
+# ===========================================
+# ОБНОВЛЕННАЯ КОМАНДА !РЕГУЛЯРНОЕ (поддерживает несколько дней)
+# ===========================================
+
+@bot.command()
+async def регулярное(ctx, дни: str, час: int, минута: int, *, текст: str):
+    """
+    Создать регулярное (периодическое) событие
+    Формат: !регулярное [дни] ЧЧ ММ текст (оглавление)
+    текст (первая строка)
+    текст (вторая строка)
+    Дни: пн, вт, ср, чт, пт, сб, вс (можно несколько через запятую)
+    Пример: !регулярное пн,ср,пт 19 00 Игровой вечер
+    """
+    # Проверяем права доступа
+    if not await check_permissions(ctx):
+        await ctx.send("❌ У вас нет доступа к этой команде!")
+        return
+    
+    # Проверяем канал для объявлений
+    if not event_manager.config.get('announcement_channel_id'):
+        await ctx.send("❌ Сначала установите канал для объявлений командой `!каналобъявлений`")
+        return
+    
+    # Конвертируем дни недели (поддерживаем несколько дней через запятую)
+    days_map = {
+        'пн': 0, 'понедельник': 0,
+        'вт': 1, 'вторник': 1,
+        'ср': 2, 'среда': 2,
+        'чт': 3, 'четверг': 3,
+        'пт': 4, 'пятница': 4,
+        'сб': 5, 'суббота': 5,
+        'вс': 6, 'воскресенье': 6
+    }
+    
+    # Разделяем строку дней по запятым
+    day_strings = [day.strip().lower() for day in дни.split(',')]
+    
+    days_of_week = []
+    invalid_days = []
+    
+    for day_str in day_strings:
+        if day_str in days_map:
+            days_of_week.append(days_map[day_str])
+        else:
+            invalid_days.append(day_str)
+    
+    if invalid_days:
+        valid_days = ", ".join(days_map.keys())
+        await ctx.send(f"❌ Неверные дни недели: {', '.join(invalid_days)}\n"
+                      f"Используйте: {valid_days}")
+        return
+    
+    if not days_of_week:
+        await ctx.send("❌ Не указаны дни недели!")
+        return
+    
+    # Удаляем дубликаты и сортируем
+    days_of_week = sorted(set(days_of_week))
+    
+    # Проверяем время
+    if not (0 <= час <= 23):
+        await ctx.send("❌ Часы должны быть от 0 до 23")
+        return
+    if not (0 <= минута <= 59):
+        await ctx.send("❌ Минуты должны быть от 0 до 59")
+        return
+    
+    # Проверяем вложения
+    image_url = None
+    attachments = []
+    
+    if ctx.message.attachments:
+        for attachment in ctx.message.attachments:
+            if attachment.content_type and 'image' in attachment.content_type:
+                if not image_url:
+                    image_url = attachment.url
+            attachments.append(attachment.url)
+    
+    # Разделяем текст
+    lines = текст.split('\n')
+    event_name = lines[0].strip()
+    custom_message = '\n'.join(lines[1:]).strip() if len(lines) > 1 else event_name
+    
+    # Добавляем регулярное событие
+    event_id = event_manager.add_recurring_event(
+        event_name=event_name,
+        days_of_week=days_of_week,
+        hour=час,
+        minute=минута,
+        author_id=ctx.author.id,
+        custom_message=custom_message,
+        image_url=image_url,
+        attachments=attachments
+    )
+    
+    # Отображаем дни недели по-русски
+    days_russian = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота', 'Воскресенье']
+    selected_days = [days_russian[day] for day in days_of_week]
+    
+    # Предпросмотр
+    embed = discord.Embed(
+        title=f"📅 **{event_name}** (Регулярное)",
+        description=custom_message,
+        color=discord.Color.purple()
+    )
+    
+    embed.add_field(
+        name="⏰ Расписание",
+        value=f"**Дни:** {', '.join(selected_days)}\n**Время:** {час:02d}:{минута:02d} (МСК)",
+        inline=False
+    )
+    
+    embed.add_field(
+        name="📢 Объявление",
+        value="Будет отправляться каждую неделю за 15 минут до начала",
+        inline=False
+    )
+    
+    if image_url:
+        embed.set_thumbnail(url=image_url)
+        embed.add_field(name="🖼️ Изображение", value="Будет прикреплено к каждому объявлению", inline=True)
+    
+    if attachments:
+        embed.set_footer(text=f"✅ Регулярное событие #{event_id} создано! 📎 {len(attachments)} вложений")
+    else:
+        embed.set_footer(text=f"✅ Регулярное событие #{event_id} создано!")
+    
+    await ctx.send("**Создано регулярное событие:**", embed=embed)
+
+# ===========================================
+# ОБНОВЛЕННАЯ КОМАНДА !РЕГУЛЯРНЫЕ
+# ===========================================
+
+@bot.command()
+async def регулярные(ctx):
+    """Показать все регулярные события"""
+    if not await check_permissions(ctx):
+        await ctx.send("❌ У вас нет доступа к этой команде!")
+        return
+    
+    if not event_manager.recurring_events:
+        await ctx.send("📭 Нет регулярных событий.")
+        return
+    
+    # Отображаем дни недели по-русски
+    days_russian = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс']
+    days_full = ['Понедельник', 'Вторник', 'Среда', 'Четверг', 'Пятница', 'Суббота', 'Воскресенье']
+    
+    embed = discord.Embed(
+        title="📅 Регулярные события",
+        color=discord.Color.purple()
+    )
+    
+    for event in event_manager.recurring_events:
+        # Форматируем дни недели
+        day_numbers = event['days_of_week']
+        day_names = [days_full[day_num] for day_num in day_numbers]
+        short_day_names = [days_russian[day_num] for day_num in day_numbers]
+        
+        event_info = (
+            f"**ID:** `{event['id']}`\n"
+            f"**Название:** {event['name']}\n"
+            f"**Дни:** {', '.join(day_names)}\n"
+            f"**Кратко:** {', '.join(short_day_names)}\n"
+            f"**Время:** {event['hour']:02d}:{event['minute']:02d} (МСК)\n"
+        )
+        
+        if event.get('last_scheduled'):
+            # Показываем последний раз для каждого дня
+            last_scheduled_text = []
+            for day_num, date_str in event['last_scheduled'].items():
+                day_name = days_russian[int(day_num)]
+                try:
+                    last_date = datetime.strptime(date_str, "%Y-%m-%d")
+                    last_scheduled_text.append(f"{day_name}: <t:{int(last_date.timestamp())}:R>")
+                except:  # noqa: E722
+                    continue
+            
+            if last_scheduled_text:
+                event_info += "**Последний раз:**\n" + "\n".join(last_scheduled_text) + "\n"
+        
+        # Обрезаем длинное описание
+        description = event['custom_message']
+        if len(description) > 100:
+            description = description[:97] + "..."
+        
+        event_info += f"**Описание:** {description}"
+        
+        embed.add_field(
+            name=f"🔄 #{event['id']}",
+            value=event_info,
+            inline=False
+        )
+    
+    embed.add_field(
+        name="🗑️ Удаление",
+        value=f"Используйте `!удалитьрег [ID]` для удаления\nПример: `!удалитьрег {event_manager.recurring_events[0]['id']}`",
+        inline=False
+    )
+    
+    await ctx.send(embed=embed)
+
+@bot.command()
+async def удалитьрег(ctx, event_id: int):
+    """Удалить регулярное событие по ID"""
+    if not await check_permissions(ctx):
+        await ctx.send("❌ У вас нет доступа к этой команде!")
+        return
+    
+    event_exists = any(e['id'] == event_id for e in event_manager.recurring_events)
+    
+    if event_exists:
+        event_manager.remove_event(event_id, is_recurring=True)
+        await ctx.send(f"✅ Регулярное событие #{event_id} удалено.")
+    else:
+        await ctx.send(f"❌ Регулярное событие #{event_id} не найдено.")
+
+# ===========================================
+# ОБНОВЛЕННАЯ КОМАНДА !СОБЫТИЯ
+# ===========================================
+
+@bot.command()
+async def события(ctx):
+    """Показать все события (обычные и регулярные)"""
+    if not await check_permissions(ctx):
+        await ctx.send("❌ У вас нет доступа к этой команде!")
+        return
+    
+    # Показываем обычные события
+    active_events = [e for e in event_manager.events if not e['finished']]
+    finished_events = [e for e in event_manager.events if e['finished']]
+    
+    # Показываем активные события
+    if active_events:
+        embed = discord.Embed(
+            title="📅 Активные события",
+            color=discord.Color.green()
+        )
+        
+        for event in active_events[:5]:
+            event_time = from_iso_with_timezone(event['event_time'])
+            announcement_time = from_iso_with_timezone(event['announcement_time'])
+            now = get_now()
+            
+            if event['announced']:
+                status = "✅ Объявлено"
+            else:
+                time_left = announcement_time - now
+                if time_left.total_seconds() > 0:
+                    status = f"⏳ Через {int(time_left.total_seconds() / 60)} мин"
+                else:
+                    status = "🕒 Скоро"
+            
+            event_info = (
+                f"**ID:** `{event['id']}`\n"
+                f"**Название:** {event['name']}\n"
+                f"**Статус:** {status}\n"
+                f"**Начало:** <t:{int(event_time.timestamp())}:F>\n"
+                f"**Объявление:** <t:{int(announcement_time.timestamp())}:R>"
+            )
+            
+            embed.add_field(
+                name=f"📌 #{event['id']}",
+                value=event_info,
+                inline=False
+            )
+        
+        await ctx.send(embed=embed)
+    else:
+        await ctx.send("📭 Нет активных событий.")
+    
+    # Показываем завершенные события
+    if finished_events:
+        recent_finished = []
+        now = get_now()
+        for event in finished_events[-3:]:  # Показываем только 3 последних
+            event_time = from_iso_with_timezone(event['event_time'])
+            days_passed = (now - event_time).days
+            
+            if days_passed <= 3:
+                recent_finished.append(event)
+        
+        if recent_finished:
+            embed = discord.Embed(
+                title="📋 Недавно завершенные события",
+                color=discord.Color.dark_grey()
+            )
+            
+            for event in recent_finished:
+                event_time = from_iso_with_timezone(event['event_time'])
+                
+                event_info = (
+                    f"**ID:** `{event['id']}`\n"
+                    f"**Название:** {event['name']}\n"
+                    f"**Завершено:** <t:{int(event_time.timestamp())}:R>"
+                )
+                
+                embed.add_field(
+                    name=f"✅ #{event['id']}",
+                    value=event_info,
+                    inline=False
+                )
+            
+            embed.set_footer(text="Автоматически удалятся через 3 дня после завершения")
+            await ctx.send(embed=embed)
+    
+    # Показываем регулярные события
+    if event_manager.recurring_events:
+        days_russian = ['Пн', 'Вт', 'Ср', 'Чт', 'Пт', 'Сб', 'Вс']
+        
+        embed = discord.Embed(
+            title="🔄 Регулярные события",
+            color=discord.Color.purple()
+        )
+        
+        for event in event_manager.recurring_events[:3]:  # Показываем до 3
+            day_numbers = event['days_of_week']
+            short_day_names = [days_russian[day_num] for day_num in day_numbers]
+            
+            event_info = (
+                f"**ID:** `Р{event['id']}`\n"
+                f"**Название:** {event['name']}\n"
+                f"**Когда:** {', '.join(short_day_names)} в {event['hour']:02d}:{event['minute']:02d} (МСК)\n"
+            )
+            
+            # Подсчитываем сколько раз отправлялось объявление
+            if event.get('last_scheduled'):
+                sent_count = len(event['last_scheduled'])
+                event_info += f"**Отправлено раз:** {sent_count}"
+            
+            embed.add_field(
+                name=f"📅 #{event['id']}",
+                value=event_info,
+                inline=False
+            )
+        
+        if len(event_manager.recurring_events) > 3:
+            embed.set_footer(text=f"И ещё {len(event_manager.recurring_events) - 3} регулярных событий. Используйте !регулярные для полного списка")
+        
+        await ctx.send(embed=embed)
+
+# ===========================================
+# ОБНОВЛЕННАЯ КОМАНДА !УДАЛИТЬ
+# ===========================================
+
+@bot.command()
+async def удалить(ctx, event_id: int):
+    """Удалить обычное событие по ID"""
+    if not await check_permissions(ctx):
+        await ctx.send("❌ У вас нет доступа к этой команде!")
+        return
+    
+    # Проверяем обычные события
+    event_exists = any(e['id'] == event_id for e in event_manager.events)
+    
+    if event_exists:
+        event_manager.remove_event(event_id, is_recurring=False)
+        await ctx.send(f"✅ Событие #{event_id} удалено.")
+    else:
+        await ctx.send(f"❌ Событие #{event_id} не найдено.")
+
+# ===========================================
+# ОБНОВЛЕННАЯ КОМАНДА !ОЧИСТКА
+# ===========================================
+
+@bot.command()
+async def очистка(ctx):
+    """Ручная очистка старых событий (более 3 дней назад)"""
+    if not await check_permissions(ctx):
+        await ctx.send("❌ У вас нет доступа к этой команде!")
+        return
+    
+    now = get_now()
+    events_to_remove = []
+    
+    for event in event_manager.events:
+        if event['finished']:
+            event_time = from_iso_with_timezone(event['event_time'])
+            days_passed = (now - event_time).days
+            
+            if days_passed > 3:
+                events_to_remove.append((event['id'], False))
+    
+    # Удаляем старые события
+    for event_id, is_recurring in events_to_remove:
+        event_manager.remove_event(event_id, is_recurring)
+    
+    if events_to_remove:
+        await ctx.send(f"✅ Удалено {len(events_to_remove)} старых событий (более 3 дней назад)")
+    else:
+        await ctx.send("📭 Нет событий для очистки (все завершенные события младше 3 дней)")
+
+# ===========================================
+# ОБНОВЛЕННАЯ КОМАНДА !КАНАЛЫ
+# ===========================================
+
+@bot.command()
+async def каналы(ctx):
+    """Проверить какие каналы установлены"""
+    if not await check_permissions(ctx):
+        await ctx.send("❌ У вас нет доступа к этой команде!")
+        return
+    
+    embed = discord.Embed(
+        title="📊 Настроенные каналы",
+        color=discord.Color.blue()
+    )
+    
+    announcement_channel_id = event_manager.config.get('announcement_channel_id')
+    if announcement_channel_id:
+        channel = bot.get_channel(announcement_channel_id)
+        embed.add_field(name="📢 Канал объявлений", value=f"#{channel.name}" if channel else "❌ Не найден", inline=True)
+    else:
+        embed.add_field(name="📢 Канал объявлений", value="❌ Не установлен", inline=True)
+    
+    admin_channel_id = event_manager.config.get('admin_channel_id')
+    if admin_channel_id:
+        channel = bot.get_channel(admin_channel_id)
+        embed.add_field(name="👑 Админ-канал", value=f"#{channel.name}" if channel else "❌ Не найден", inline=True)
+    else:
+        embed.add_field(name="👑 Админ-канал", value="❌ Не установлен", inline=True)
+    
+    active = len([e for e in event_manager.events if not e['finished']])
+    recurring = len(event_manager.recurring_events)
+    allowed_roles = len(event_manager.config.get('allowed_roles', []))
+    
+    embed.add_field(name="📈 Статистика", 
+                   value=f"Активных: {active}\nРегулярных: {recurring}\nРазрешенных ролей: {allowed_roles}", 
+                   inline=True)
+    
+    await ctx.send(embed=embed)
+
+# ===========================================
+# КОМАНДЫ ДЛЯ НАСТРОЙКИ (только для администраторов)
+# ===========================================
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def каналобъявлений(ctx):
+    """Установить текущий канал для объявлений"""
+    event_manager.config['announcement_channel_id'] = ctx.channel.id
+    event_manager.save_config()
+    await ctx.send(f"✅ Этот канал теперь используется для объявлений: #{ctx.channel.name}")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def каналадмин(ctx):
+    """Установить текущий канал для управления"""
+    event_manager.config['admin_channel_id'] = ctx.channel.id
+    event_manager.save_config()
+    
+    embed = discord.Embed(
+        title="✅ Админ-канал установлен",
+        description=f"Канал #{ctx.channel.name} теперь используется для управления событиями",
+        color=discord.Color.green()
+    )
+    
+    embed.add_field(
+        name="📝 Команды:",
+        value=(
+            "`!новое ДД ММ ГГГГ ЧЧ ММ текст` - разовое событие\n"
+            "`!регулярное дни ЧЧ ММ текст` - регулярное событие\n"
+            "`!события` - показать все события\n"
+            "`!регулярные` - показать регулярные\n"
+            "`!удалить ID` - удалить разовое\n"
+            "`!удалитьрег ID` - удалить регулярное\n"
+            "`!очистка` - ручная очистка старых\n"
+            "`!роли` - показать разрешенные роли\n"
+            "`!помощь` - показать все команды\n"
+            "`!каналы` - проверить настройки"
+        ),
+        inline=False
+    )
+    
+    embed.add_field(
+        name="👑 Только для администраторов:",
+        value=(
+            "`!добавитьроль @роль` - добавить разрешенную роль\n"
+            "`!удалитьроль @роль` - удалить роль из разрешенных\n"
+            "`!каналобъявлений` - установить канал для объявлений\n"
+            "`!каналадмин` - установить канал для управления\n"
+            "`!рассылка текст` - отправить тестовое объявление"
+        ),
+        inline=False
+    )
+    
+    await ctx.send(embed=embed)
+
+# ===========================================
+# ОСТАЛЬНЫЕ КОМАНДЫ (без изменений, но с новой проверкой)
+# ===========================================
+
+@bot.command()
+async def новое(ctx, день: int, месяц: int, год: int, час: int, минута: int, *, текст: str):
+    """Создать новое разовое событие"""
+    if not await check_permissions(ctx):
+        await ctx.send("❌ У вас нет доступа к этой команде!")
+        return
+    
+    # Проверяем канал для объявлений
+    if not event_manager.config.get('announcement_channel_id'):
+        await ctx.send("❌ Сначала установите канал для объявлений командой `!каналобъявлений`")
+        return
+    
+    try:
+        # Создаем время события В МОСКОВСКОМ ВРЕМЕНИ
+        event_time = parse_datetime(год, месяц, день, час, минута)
+        
+        # Время объявления (за 15 минут до события)
+        announcement_time = event_time - timedelta(minutes=15)
+        
+        now = get_now()
+        
+        # Проверяем, что время в будущем
+        if event_time <= now:
+            await ctx.send("❌ Время события должно быть в будущем!")
+            return
+        
+        if announcement_time <= now:
+            await ctx.send("❌ Время объявления уже прошло! Установите более позднее время события.")
+            return
+        
+        # Проверяем вложения
+        image_url = None
+        attachments = []
+        
+        if ctx.message.attachments:
+            for attachment in ctx.message.attachments:
+                if attachment.content_type and 'image' in attachment.content_type:
+                    if not image_url:
+                        image_url = attachment.url
+                attachments.append(attachment.url)
+        
+        # Разделяем текст
+        lines = текст.split('\n')
+        event_name = lines[0].strip()
+        custom_message = '\n'.join(lines[1:]).strip() if len(lines) > 1 else event_name
+        
+        # Добавляем событие
+        event_id = event_manager.add_event(
+            event_name=event_name,
+            event_time=event_time,
+            announcement_time=announcement_time,
+            author_id=ctx.author.id,
+            custom_message=custom_message,
+            image_url=image_url,
+            attachments=attachments
+        )
+        
+        # Предпросмотр
+        embed = discord.Embed(
+            title=f"📅 **{event_name}**",
+            description=custom_message,
+            color=discord.Color.blue(),
+            timestamp=event_time
+        )
+        
+        embed.add_field(
+            name="⏰ Начало",
+            value=f"<t:{int(event_time.timestamp())}:F>",
+            inline=False
+        )
+        
+        embed.add_field(
+            name="📢 Объявление",
+            value=f"Будет отправлено <t:{int(announcement_time.timestamp())}:R>",
+            inline=False
+        )
+        
+        if image_url:
+            embed.set_thumbnail(url=image_url)
+            embed.add_field(name="🖼️ Изображение", value="Будет прикреплено к объявлению", inline=True)
+        
+        if attachments:
+            embed.set_footer(text=f"✅ Событие #{event_id} создано! 📎 {len(attachments)} вложений")
+        else:
+            embed.set_footer(text=f"✅ Событие #{event_id} создано!")
+        
+        await ctx.send("**Создано новое событие:**", embed=embed)
+        
+    except ValueError as e:
+        await ctx.send(f"❌ Ошибка в дате или времени: {e}")
+
+@bot.command()
+async def инфо(ctx, event_id: int):
+    """Показать информацию о событии"""
+    if not await check_permissions(ctx):
+        await ctx.send("❌ У вас нет доступа к этой команде!")
+        return
+    
+    # Ищем обычное событие
+    event = next((e for e in event_manager.events if e['id'] == event_id), None)
+    
+    if not event:
+        await ctx.send(f"❌ Событие #{event_id} не найдено.")
+        return
+    
+    event_time = from_iso_with_timezone(event['event_time'])
+    announcement_time = from_iso_with_timezone(event['announcement_time'])
+    now = get_now()
+    
+    embed = discord.Embed(
+        title=f"📋 **{event['name']}**",
+        description=event['custom_message'],
+        color=discord.Color.blue(),
+        timestamp=event_time
+    )
+    
+    status = "✅ Объявлено" if event['announced'] else "⏳ Ожидает объявления"
+    status = "✅ Завершено" if event['finished'] else status
+    
+    embed.add_field(name="🆔 ID", value=event['id'], inline=True)
+    embed.add_field(name="📊 Статус", value=status, inline=True)
+    
+    if event['announced'] and not event['finished']:
+        time_to_event = event_time - now
+        if time_to_event.total_seconds() > 0:
+            embed.add_field(
+                name="⏳ До начала",
+                value=f"{int(time_to_event.total_seconds() / 60)} минут",
+                inline=True
+            )
+        else:
+            embed.add_field(name="⏳ До начала", value="Скоро начнется", inline=True)
+    
+    embed.add_field(name="⏰ Начало", value=f"<t:{int(event_time.timestamp())}:F>", inline=False)
+    embed.add_field(name="📢 Объявление", value=f"<t:{int(announcement_time.timestamp())}:R>", inline=True)
+    
+    author = ctx.guild.get_member(event['author'])
+    if author:
+        embed.add_field(name="👤 Создал", value=author.mention, inline=True)
+    
+    if event.get('image_url'):
+        embed.set_image(url=event['image_url'])
+    
+    if event.get('attachments'):
+        attachments_text = "\n".join([f"• {url}" for url in event['attachments'][:3]])
+        if len(event['attachments']) > 3:
+            attachments_text += f"\n... и ещё {len(event['attachments']) - 3}"
+        embed.add_field(name="📎 Вложения", value=attachments_text, inline=False)
+    
+    await ctx.send(embed=embed)
+
+@bot.command()
+async def тест(ctx):
+    """Тестовая команда для проверки бота"""
+    if not await check_permissions(ctx):
+        await ctx.send("❌ У вас нет доступа к этой команде!")
+        return
+    
+    embed = discord.Embed(
+        title="🤖 Бот работает!",
+        description="Система объявлений активна и готова к работе.",
+        color=discord.Color.green()
+    )
+    
+    # Статистика
+    active_events = len([e for e in event_manager.events if not e['finished']])
+    total_events = len(event_manager.events)
+    recurring_events = len(event_manager.recurring_events)
+    
+    embed.add_field(name="📊 Статистика", 
+                   value=f"Активных событий: {active_events}\nВсего событий: {total_events}\nРегулярных: {recurring_events}", 
+                   inline=True)
+    
+    # Проверка каналов
+    announcement_channel = bot.get_channel(event_manager.config.get('announcement_channel_id'))
+    admin_channel = bot.get_channel(event_manager.config.get('admin_channel_id'))
+    
+    channels_status = []
+    if announcement_channel:
+        channels_status.append(f"✅ Объявления: #{announcement_channel.name}")
+    else:
+        channels_status.append("❌ Объявления: не установлен")
+    
+    if admin_channel:
+        channels_status.append(f"✅ Управление: #{admin_channel.name}")
+    else:
+        channels_status.append("❌ Управление: не установлен")
+    
+    embed.add_field(name="📢 Каналы", value="\n".join(channels_status), inline=True)
+    
+    # Проверка разрешенных ролей
+    allowed_roles = event_manager.config.get('allowed_roles', [])
+    roles_count = len(allowed_roles)
+    if roles_count > 0:
+        embed.add_field(name="👥 Разрешенные роли", value=f"{roles_count} роль(ей) имеет доступ", inline=True)
+    else:
+        embed.add_field(name="👥 Разрешенные роли", value="Только администраторы", inline=True)
+    
+    # Время работы
+    now = get_now()
+    uptime = now - bot.start_time if hasattr(bot, 'start_time') else timedelta(seconds=0)
+    embed.set_footer(text=f"Время работы: {int(uptime.total_seconds() / 3600)} ч {int((uptime.total_seconds() % 3600) / 60)} мин")
+    
+    await ctx.send(embed=embed)
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def рассылка(ctx, *, сообщение: str):
+    """Отправить тестовое объявление в канал"""
+    channel_id = event_manager.config.get('announcement_channel_id')
+    if not channel_id:
+        await ctx.send("❌ Не установлен канал для объявлений!")
+        return
+    
+    channel = bot.get_channel(channel_id)
+    if not channel:
+        await ctx.send("❌ Канал для объявлений не найден!")
+        return
+    
+    try:
+        embed = discord.Embed(
+            title="📢 **ТЕСТОВОЕ ОБЪЯВЛЕНИЕ**",
+            description=сообщение,
+            color=discord.Color.gold(),
+            timestamp=get_now()
+        )
+        
+        embed.add_field(
+            name="ℹ️ Информация",
+            value="Это тестовое объявление для проверки работы бота",
+            inline=False
+        )
+        
+        embed.set_footer(text=f"Отправлено: {ctx.author.display_name}")
+        
+        await channel.send(embed=embed)
+        await ctx.send(f"✅ Тестовое объявление отправлено в {channel.mention}")
+        
+    except Exception as e:
+        await ctx.send(f"❌ Ошибка отправки: {e}")
+
+@bot.event
+async def on_command_error(ctx, error):
+    """Обработка ошибок команд"""
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("❌ У вас недостаточно прав для выполнения этой команды!")
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(f"❌ Неправильное использование команды! Попробуйте: `{ctx.prefix}{ctx.command.name} {ctx.command.signature}`")
+    elif isinstance(error, commands.BadArgument):
+        await ctx.send("❌ Неправильный аргумент! Проверьте правильность ввода.")
+    else:
+        print(f"Ошибка команды: {error}")
+        await ctx.send("❌ Произошла ошибка при выполнении команды!")
+
+# ===========================================
+# ДЛЯ REPLIT (UPTIME ROBOT)
+# ===========================================
+
+app = Flask('')
+
+@app.route('/')
+def home():
+    return "✅ Бот работает! Время: " + time.strftime("%Y-%m-%d %H:%M:%S")
+
+def run():
+    app.run(host='0.0.0.0', port=8080)
+
+def keep_alive():
+    t = Thread(target=run)
+    t.start()
+
+# Запускаем Flask сервер в отдельном потоке
+keep_alive()
+
+# ===========================================
+# ЗАПУСК БОТА
+# ===========================================
+bot.run(TOKEN)
