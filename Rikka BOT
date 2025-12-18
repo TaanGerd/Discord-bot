@@ -44,7 +44,7 @@ def from_iso_with_timezone(iso_string):
             dt = datetime.fromisoformat(iso_string + '+00:00')
         return dt.astimezone(TIMEZONE)
 
-TOKEN = ''
+TOKEN = os.environ['DISCORD_TOKEN']
 
 intents = discord.Intents.default()
 intents.members = True
